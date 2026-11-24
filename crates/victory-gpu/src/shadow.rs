@@ -103,6 +103,23 @@ struct Card {
     size: u64,
 }
 
+/// Whether a refresh compares the pages the title wrote with the copy and
+/// puts in only the 4 KiB pieces that differ (`VICTORY_COPY_COMPARE=1`; off
+/// by default). The write watch tells which pages were written, not whether
+/// their bytes changed; in a still scene the title writes 100-150 MB a
+/// frame of its buffers again, and for a copy in the card's memory every
+/// such byte went up and was hashed there again. With the switch a piece
+/// written with the bytes it held stays as it is: not copied, not sent up.
+pub(crate) fn copy_compare() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_COPY_COMPARE").is_some_and(|v| v == "1"))
+}
+
+/// Since the last frame-rate line, with [`copy_compare`]: bytes the title
+/// wrote that a refresh compared, and of them those that held what the
+/// copy held (not put in, not sent up).
+pub(crate) static COPY_COMPARED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
 /// Whether the host copies of big title buffers are in the card's own
 /// memory (on by default since run 75 showed it holds: the BVH skinning
 /// list went from 50.5 to 4.5 ms on the card; `VICTORY_CARD_BUFFERS=0`
@@ -2461,6 +2478,9 @@ impl Shadow {
     fn copy(&self, from: usize, to: usize) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
+        if from < to && copy_compare() {
+            return self.copy_compared(from, to);
+        }
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
         crate::host::copy_mapped(at, from as *const u8, to - from, false);
@@ -2468,6 +2488,47 @@ impl Shadow {
         self.changed(from - start, to - start);
         self.card_changed(from - start, to - start);
         to - from
+    }
+
+    /// [`Shadow::copy`] with [`copy_compare`]: title memory `[from, to)` is
+    /// read into scratch memory, and only the 4 KiB pieces that differ from
+    /// the copy are put in and noted changed (for snapshots and for the
+    /// card's side). Returns the bytes that differed.
+    fn copy_compared(&self, from: usize, to: usize) -> usize {
+        const PIECE: usize = 4096;
+        let start = self.start as usize;
+        thread_local! {
+            static SCRATCH: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        SCRATCH.with(|s| {
+            let mut title = s.borrow_mut();
+            title.clear();
+            title.resize(to - from, 0);
+            crate::host::copy_mapped(title.as_mut_ptr(), from as *const u8, to - from, false);
+            // SAFETY: inside the mapping (`from` and `to` are within the buffer).
+            let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(from - start), to - from) };
+            let (mut changed, mut run): (usize, Option<usize>) = (0, None);
+            let mut at = 0;
+            while at <= title.len() {
+                let end = (at + PIECE).min(title.len());
+                let differs = at < title.len() && title[at..end] != held[at..end];
+                if differs {
+                    run.get_or_insert(at);
+                } else if let Some(first) = run.take() {
+                    held[first..at].copy_from_slice(&title[first..at]);
+                    self.changed(from - start + first, from - start + at);
+                    self.card_changed(from - start + first, from - start + at);
+                    changed += at - first;
+                }
+                if at == title.len() {
+                    break;
+                }
+                at = end;
+            }
+            COPY_COMPARED[0].fetch_add((to - from) as u64, Ordering::Relaxed);
+            COPY_COMPARED[1].fetch_add((to - from - changed) as u64, Ordering::Relaxed);
+            changed
+        })
     }
 
     /// Whether shaders read and write this copy in the card's own memory
