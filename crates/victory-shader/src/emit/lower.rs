@@ -244,6 +244,9 @@ struct Lower<'a> {
     /// of two exchange dwords, whether the group has no upper half (32 threads or fewer), and per
     /// IR block whether every lane runs it (exchanges need both halves there).
     exchange: Option<(u32, bool, Vec<bool>)>,
+    /// With `exchange`: the first LDS dword of the slots `ds_bpermute_b32` passes values
+    /// through between the two host waves of a console wave (one per thread of the group).
+    permute_area: Option<u32>,
     /// With `exchange`: nothing is exchanged, each host wave acts as a wave
     /// of its own ([`with_local_waves`]).
     local: bool,
@@ -1356,6 +1359,7 @@ impl<'a> Lower<'a> {
         let mut lds_meet: Option<(Vec<bool>, Vec<(bool, bool)>)> = None;
         // a console wave64 program in two host waves of 32 (`exchange`)
         let mut exchange: Option<(u32, bool, Vec<bool>)> = None;
+        let mut permute_area: Option<u32> = None;
         // a console wave64 program in host waves of 32: the LDS dword of `wave_base`'s counter
         let mut halves: Option<u32> = None;
         if let StageIo::Cs(cs) = x.native.io {
@@ -1438,6 +1442,12 @@ impl<'a> Lower<'a> {
                                 // numbers go through two exchange dwords past the program's LDS
                                 exchange = Some((s.lds_dwords, group <= 32, all));
                                 s.lds_dwords += 2 * group.div_ceil(64);
+                                // a backward permute may name a lane in the other host wave:
+                                // its value goes through a slot per thread
+                                if group > 32 && insts().any(|i| i.name() == "ds_bpermute_b32") {
+                                    permute_area = Some(s.lds_dwords);
+                                    s.lds_dwords += 64 * group.div_ceil(64);
+                                }
                             }
                         }
                     }
@@ -1624,6 +1634,7 @@ impl<'a> Lower<'a> {
                 _ => Default::default(),
             },
             exchange,
+            permute_area,
             clane: None,
             pair: None,
             halves,
@@ -4371,9 +4382,56 @@ impl<'a> Lower<'a> {
             // host gives it; the console reads 0.
             self.cross_lane(false)?;
             if self.exchange.as_ref().is_some_and(|e| !e.1) {
-                // a console wave of 64 run as two host waves: the lane named
-                // may be in the other one
-                return Err("a lane permute across two host waves");
+                // A console wave of 64 run as two host waves: the lane named
+                // may be in the other one. Every thread of the group puts its
+                // value in its own LDS slot, and after a group barrier each
+                // reads the slot of the lane it names in its console wave
+                // (64 slots a console wave). The barriers need every lane of
+                // the group here: elsewhere the branches around the block are
+                // to be taken wave-wide first (`need`).
+                let b = self.cur_ir;
+                let area = self.permute_area.filter(|_| !self.local && self.all_lanes(b));
+                let Some(area) = area else {
+                    if !self.local {
+                        need(b);
+                    }
+                    return Err("a lane permute across two host waves");
+                };
+                let at = self.vgprs(inst, addr.as_ref().ok_or("a permute address")?, 1)?[0];
+                let x = self.vgprs(inst, data.first().ok_or("a permute source")?, 1)?[0];
+                let o = self.s.m.i32(offset);
+                let at = self.s.m.bin(c, Bin::Add, at, o);
+                let two = self.s.m.i32(2);
+                let src = self.s.m.bin(c, Bin::LShr, at, two);
+                let k63 = self.s.m.i32(63);
+                let src = self.s.m.bin(c, Bin::And, src, k63);
+                // a source lane outside the console's EXEC gives 0
+                let x = match guard {
+                    Some(g) => {
+                        let z = self.s.m.i32(0);
+                        self.s.m.select(c, g, x, z)
+                    }
+                    None => x,
+                };
+                let thread = self.console_thread();
+                let base = self.s.m.i32(area);
+                let mine = self.s.m.bin(c, Bin::Add, base, thread);
+                let lds = self.s.lds();
+                let slot = self.s.m.element(c, lds, mine);
+                self.s.m.store(c, slot, x);
+                self.group_sync(c);
+                let not63 = self.s.m.i32(!63u32);
+                let first = self.s.m.bin(c, Bin::And, thread, not63);
+                let from = self.s.m.bin(c, Bin::Add, base, first);
+                let from = self.s.m.bin(c, Bin::Add, from, src);
+                let lds = self.s.lds();
+                let slot = self.s.m.element(c, lds, from);
+                let r = self.s.m.load(c, slot);
+                // the slots are written again only after every thread read them
+                self.group_sync(c);
+                let reg = dst_reg.ok_or("a permute result")?;
+                self.write(inst, Reg::V(reg), r, guard);
+                return Ok(());
             }
             let at = self.vgprs(inst, addr.as_ref().ok_or("a permute address")?, 1)?[0];
             let x = self.vgprs(inst, data.first().ok_or("a permute source")?, 1)?[0];
@@ -5770,6 +5828,49 @@ impl<'a> Lower<'a> {
                 first: 0,
             };
             let used = self.used_kind(&src);
+            // A descriptor loaded from a table, at an index the code may
+            // compute, whose dwords are only read as numbers (the shadow
+            // trace programs take a ray-tracing structure's base address
+            // out of one and walk the memory behind it): its dwords as the
+            // title wrote them, read from title memory at the table's title
+            // address (from the host) plus the load's offset.
+            // The same for one loaded from the resource heap (bindless), at
+            // the heap's title address.
+            if let Some(a) = self.scalar.get(&site).copied()
+                && let Some(rp) = self.x.native.layout.get(a.param).copied()
+                && let Some((word, slot)) = match rp.root {
+                    RootType::Table => Some((super::shader::USER_TABLE_ADDRESS, rp.slot)),
+                    RootType::ResourceHeap => Some((super::shader::USER_HEAP_ADDRESS, 0)),
+                    _ => None,
+                }
+            {
+                let c = self.cur;
+                let (i32t, res) = (self.s.t.i32, self.s.t.res_ret);
+                let mut lo = self.host_word(RootType::Other(word), slot, 0);
+                let mut hi = self.host_word(RootType::Other(word + 1), slot, 0);
+                if let Some(d) = a.dynamic {
+                    let d = self.i32_of(d)?;
+                    let sum = self.s.m.bin(c, Bin::Add, lo, d);
+                    let carry = self.s.m.cmp(c, pred::IULT, sum, lo);
+                    let carry = self.s.m.cast(c, Cast::ZExt, carry, i32t);
+                    hi = self.s.m.bin(c, Bin::Add, hi, carry);
+                    lo = sum;
+                }
+                let (iu, align) = (self.s.m.undef(i32t), self.s.m.i32(4));
+                for first in (0..count).step_by(4) {
+                    let n = (count - first).min(4);
+                    let (lo, hi) = self.address_plus(lo, hi, a.offset.wrapping_add(4 * first) as i32);
+                    let (h, byte) = self.memory(lo, hi, None);
+                    let mask = self.s.m.i8((1u8 << n) - 1);
+                    let r = self.s.op(c, "rawBufferLoad.f32", Attr::ReadOnly, res, 139, &[h, byte, iu, mask, align]);
+                    for k in 0..n {
+                        let x = self.s.m.extract(c, r, k);
+                        let x = self.as_int(x);
+                        self.write(inst, Reg::S(code + (first + k) as u8), x, None);
+                    }
+                }
+                return Ok(());
+            }
             if count != 8 || used.is_some_and(|u| u.kind != ResourceType::Srv) {
                 return Err("a descriptor read only as data");
             }

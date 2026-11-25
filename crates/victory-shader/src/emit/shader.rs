@@ -69,6 +69,15 @@ pub const USER_VIEW_ADDRESS: u32 = 0x101;
 /// view. Asked for every root UAV, and for the root SRVs of programs with
 /// a spilled user-data table.
 pub const USER_VIEW_BIAS: u32 = 0x103;
+/// `RootType::Other` code of a user-data dword the host computes: the low
+/// 32 bits of the title address of the descriptor table of root parameter
+/// `slot`; [`USER_TABLE_ADDRESS`] + 1: its bits from 32 up. (Console code
+/// loads descriptors from a table and reads their dwords as numbers.)
+pub const USER_TABLE_ADDRESS: u32 = 0x104;
+/// `RootType::Other` code of a user-data dword the host computes: the low
+/// 32 bits of the title address of the first descriptor of the bound view
+/// heap; [`USER_HEAP_ADDRESS`] + 1: its bits from 32 up.
+pub const USER_HEAP_ADDRESS: u32 = 0x106;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {

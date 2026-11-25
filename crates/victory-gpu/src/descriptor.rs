@@ -67,6 +67,12 @@ pub(crate) fn heap<'a>(this: This) -> &'a Heap {
 }
 
 impl Heap {
+    /// Whether the heap's descriptors are in the title's own memory (a
+    /// placed heap), not in memory the runtime allocated.
+    pub(crate) fn placed(&self) -> bool {
+        self.memory.is_none()
+    }
+
     /// Whether this is a sampler heap.
     pub(crate) fn samplers(&self) -> bool {
         self.desc.kind == SAMPLERS

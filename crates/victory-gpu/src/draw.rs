@@ -688,9 +688,33 @@ impl State {
         dword: u32,
         memory: Option<&crate::memory::Ready>,
     ) -> u32 {
-        use victory_shader::emit::{USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS};
+        use victory_shader::emit::{
+            USER_HEAP_ADDRESS, USER_MEMORY_BASE, USER_TABLE_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
+        };
+        if kind == USER_HEAP_ADDRESS || kind == USER_HEAP_ADDRESS + 1 {
+            // The title address of the bound view heap's first descriptor.
+            let start = match self.heaps[0] {
+                0 => 0,
+                h => {
+                    let heap = crate::descriptor::heap(h as This);
+                    if !heap.placed() {
+                        once!("a shader reads descriptors out of a view heap the runtime allocated: it reads 0 (no title copy of that memory)");
+                    }
+                    heap.start
+                }
+            };
+            return if kind == USER_HEAP_ADDRESS { start as u32 } else { (start >> 32) as u32 };
+        }
         if kind == USER_MEMORY_BASE {
             return memory.map_or(0, |m| m.base);
+        }
+        if kind == USER_TABLE_ADDRESS || kind == USER_TABLE_ADDRESS + 1 {
+            // The title address of the descriptor table of root parameter `slot`.
+            let table = match self.roots_ref(compute).get(usize::from(slot)) {
+                Some(&Root::Table(table)) => table,
+                _ => 0,
+            };
+            return if kind == USER_TABLE_ADDRESS { table as u32 } else { (table >> 32) as u32 };
         }
         if kind == USER_VIEW_BIAS {
             // The view begins on 16 bytes of the copy the address finds
@@ -738,6 +762,9 @@ impl State {
         for root in self.roots_ref(compute) {
             match root {
                 Root::View(address) => addresses.push(*address),
+                // Tables too: a shader may read a descriptor's dwords out
+                // of one as numbers (`USER_TABLE_ADDRESS`).
+                Root::Table(address) => addresses.push(*address),
                 Root::Constants(values) => constants.extend_from_slice(values),
                 _ => {}
             }

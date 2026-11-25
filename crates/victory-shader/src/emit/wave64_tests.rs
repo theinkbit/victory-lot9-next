@@ -572,3 +572,36 @@ fn a_scan_over_console_waves_sums_each_waves_predecessors() {
     assert!(wrong.is_empty(), "threads (index, got, want): {wrong:?}");
     eprintln!("ran on the hardware device: every thread has its waves' predecessors' sum");
 }
+
+/// One console wave of 64 run as two host waves of 32: each thread t reads thread t ^ 32's
+/// value with `ds_bpermute_b32`, always a lane in the other host wave, as the checkerboard
+/// shadow-mask generators read their neighbours' samples. Thread s0 stores what it read.
+#[test]
+fn a_backward_permute_reads_a_lane_in_the_other_host_wave() {
+    let words = [
+        0x4A02_00FF, // v_add_nc_u32_e32 v1, 0x1000, v0
+        0x0000_1000,
+        0x3A04_00A0, // v_xor_b32_e32 v2, 32, v0
+        0x3404_0482, // v_lshlrev_b32_e32 v2, 2, v2
+        0xDACC_0000, // ds_bpermute_b32 v3, v2, v1
+        0x0300_0102,
+        0xBF8C_0000, // s_waitcnt 0
+        0x7D84_0000, // v_cmp_eq_u32 vcc, s0, v0
+        0xBE82_246A, // s_and_saveexec_b64 s[2:3], vcc
+        0x38 << 26 | 0x1C << 18,
+        0x80 << 24 | 2 << 16 | 3 << 8, // buffer_store_dword v3, off, s[8:11], 0
+    ];
+    let native = native(&words);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let shader = lowered(&native, &p, &HashSet::new()).expect("lower");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for lane in [0u32, 5, 31, 32, 40, 63] {
+        let Some(got) = on_the_card(&shader, [lane, 0]) else { return };
+        assert_eq!(got, 0x1000 + (lane ^ 32), "thread {lane}");
+    }
+    eprintln!("ran on the hardware device: every thread read the other host wave's lane");
+}
