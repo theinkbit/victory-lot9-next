@@ -1481,8 +1481,15 @@ impl State {
         if !*ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_TEXTURES").is_none_or(|v| v != "0")) {
             return;
         }
-        /// Bytes of texture memory staged per frame.
-        const PER_FRAME: u64 = 192 << 20;
+        /// Bytes of texture memory staged per frame: 192 MiB, or
+        /// `VICTORY_HEAP_TEXTURE_MB`. A frame budget made for frames of a
+        /// few tens of milliseconds: at 1 to 3 fps it staged about 300 MB a
+        /// second, and 20,000 textures waited with their objects drawn
+        /// white (2026-11-25).
+        static PER_FRAME_MB: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        let per_frame = *PER_FRAME_MB.get_or_init(|| {
+            std::env::var("VICTORY_HEAP_TEXTURE_MB").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(192)
+        }) << 20;
         static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
         static SPENT: AtomicU64 = AtomicU64::new(0);
         let frame = crate::frame::current();
@@ -1538,7 +1545,7 @@ impl State {
         const SPAN: std::time::Duration = std::time::Duration::from_millis(250);
         let began = std::time::Instant::now();
         for (index, write) in due {
-            if SPENT.load(Ordering::Relaxed) >= PER_FRAME || began.elapsed() > SPAN {
+            if SPENT.load(Ordering::Relaxed) >= per_frame || began.elapsed() > SPAN {
                 break;
             }
             // A placed texture whose memory is not mapped (not streamed in
