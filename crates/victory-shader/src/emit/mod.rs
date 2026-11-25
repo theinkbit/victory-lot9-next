@@ -235,6 +235,21 @@ pub struct UserData {
     pub dword: u32,
 }
 
+thread_local! {
+    /// Set by [`with_wave_wide`]: the wide form for the program being translated.
+    static WAVE_WIDE_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` with the wide wave64 form (group barriers inside branches and
+/// loops) allowed for the programs it translates on this thread, as
+/// `VICTORY_WAVE_WIDE=1` allows it for every program.
+pub fn with_wave_wide<R>(f: impl FnOnce() -> R) -> R {
+    let before = WAVE_WIDE_HERE.with(|w| w.replace(true));
+    let r = f();
+    WAVE_WIDE_HERE.with(|w| w.set(before));
+    r
+}
+
 /// Translates the vertex, pixel, compute or mesh program of a console
 /// shader container.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
@@ -369,7 +384,8 @@ fn emit_once(
         // lost the card in a submission of two programs that had just moved to it
         // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs' form below, which
         // has no barrier, stays on.
-        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1");
+        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1")
+            || WAVE_WIDE_HERE.with(|w| w.get());
         // exact first: each host wave on its own where that is exact (the idiom, every
         // form; no barriers), then the other exact forms; then approximate
         for exact in [true, false] {

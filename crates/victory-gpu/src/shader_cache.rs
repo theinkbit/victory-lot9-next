@@ -47,7 +47,7 @@ pub enum PrecompileOutcome {
 /// Fills the runtime shader cache and reports whether the entry was already there.
 pub fn precompile_shader(container: &[u8]) -> Result<PrecompileOutcome, String> {
     let cache = CACHE.get().ok_or("no shader cache")?;
-    let (result, status) = lookup(cache, container);
+    let (result, status) = lookup(cache, container, wave_wide_listed(container));
     match (result, status) {
         (_, CacheStatus::Failed(error)) => Err(error),
         (Ok(_), CacheStatus::Hit) => Ok(PrecompileOutcome::Cached),
@@ -104,7 +104,12 @@ fn build() -> &'static [u8; 32] {
 /// Uses an in-memory translation when the disk cache cannot be written.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
     let (result, status) = match CACHE.get() {
-        Some(cache) => lookup(cache, container),
+        Some(cache) => lookup(cache, container, wave_wide_listed(container)),
+        None if wave_wide_listed(container) => (
+            victory_shader::emit::with_wave_wide(|| victory_shader::emit::translate(container))
+                .map_err(|e| e.to_string()),
+            CacheStatus::Unstored,
+        ),
         None => (
             victory_shader::emit::translate(container).map_err(|e| e.to_string()),
             CacheStatus::Unstored,
@@ -158,16 +163,52 @@ enum CacheStatus {
 
 type Translation = Result<HostShader, String>;
 
-fn lookup(cache: &Cache, container: &[u8]) -> (Translation, CacheStatus) {
+/// Whether `VICTORY_WAVE_WIDE_ONLY=<hash>,...` names this container (the 16
+/// hex digits the logs and the debug overlay show): the wide wave64 form for
+/// that program alone, which a 32-lane host otherwise refuses at 64-lane waves.
+fn wave_wide_listed(container: &[u8]) -> bool {
+    static ONLY: OnceLock<Vec<String>> = OnceLock::new();
+    let only = ONLY.get_or_init(|| {
+        std::env::var("VICTORY_WAVE_WIDE_ONLY")
+            .map(|v| {
+                v.split([',', ' ', ';'])
+                    .map(|h| h.trim().trim_start_matches('#').to_ascii_lowercase())
+                    .filter(|h| !h.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default()
+    });
+    !only.is_empty() && {
+        let hash = blake3::hash(container).to_hex();
+        only.iter().any(|h| hash.starts_with(h.as_str()))
+    }
+}
+
+/// [`build`] for a program translated in the wide form: its own cache entry.
+fn build_wide() -> &'static [u8; 32] {
+    static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
+    BUILD.get_or_init(|| {
+        let mut key = blake3::Hasher::new();
+        key.update(build());
+        key.update(b"VICTORY_WAVE_WIDE for this program");
+        *key.finalize().as_bytes()
+    })
+}
+
+fn translate_wide(container: &[u8]) -> Result<HostShader, ShaderError> {
+    victory_shader::emit::with_wave_wide(|| victory_shader::emit::translate(container))
+}
+
+fn lookup(cache: &Cache, container: &[u8], wide: bool) -> (Translation, CacheStatus) {
     let container = canonical_container(container);
     for _ in 0..2 {
         let expected = target();
         let translated = cached(
             cache,
-            build(),
+            if wide { build_wide() } else { build() },
             expected,
             container,
-            victory_shader::emit::translate,
+            if wide { translate_wide } else { victory_shader::emit::translate },
             || target() == expected,
         );
         if target() == expected {
