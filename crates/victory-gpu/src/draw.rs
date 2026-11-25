@@ -95,6 +95,14 @@ fn early_budgets() -> (u64, u64) {
     })
 }
 
+/// `VICTORY_IDLE_TEXTURES_MS`: the early texture pass's budget after a frame of few draws.
+fn idle_texture_ms() -> u64 {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MS.get_or_init(|| {
+        std::env::var("VICTORY_IDLE_TEXTURES_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(120)
+    })
+}
+
 /// The pixel shaders of the title's decoration bake (the title:
 /// `PS_BakeDecorations_*`), by the first 16 hex digits of their hash as the
 /// frame listings print it. They draw into a 256x256 corner of 2048x2048
@@ -1541,10 +1549,23 @@ impl State {
         if first {
             BAKED_MS.store(0, Ordering::Relaxed);
         }
+        // The draws of the frame before: few (a loading screen's) leave the card idle, so the
+        // pass gets a larger budget there and the queue drains while the title loads
+        // (`VICTORY_IDLE_TEXTURES_MS`, 120 by default; 0: the early budget only).
+        static DRAWN_AT: AtomicU64 = AtomicU64::new(0);
+        static LIGHT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if first {
+            let now = drawn();
+            let before = DRAWN_AT.swap(now, Ordering::Relaxed);
+            LIGHT.store(now.saturating_sub(before) < 200, Ordering::Relaxed);
+        }
+        let idle_ms = idle_texture_ms();
         let left = bake_ms.saturating_sub(BAKED_MS.load(Ordering::Relaxed));
         let budget = if bake && left > 0 {
             // What a bake may read must be there now: up to 2 GiB.
             (left, 2 << 30)
+        } else if first && idle_ms > 0 && LIGHT.load(Ordering::Relaxed) {
+            (idle_ms, 1 << 30)
         } else if first && early_ms > 0 {
             (early_ms, 64 << 20)
         } else {
