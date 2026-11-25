@@ -1089,6 +1089,23 @@ pub(super) fn with_local_waves_any<R>(f: impl FnOnce() -> R) -> R {
 /// a wave-wide result as data for the whole console wave (a tile's maximum,
 /// say, with one wave per thread group) gets its half's result. It is used
 /// only for programs that do not translate otherwise.
+thread_local! {
+    /// Set by [`with_group_wide`].
+    static GROUP_WIDE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` with the branches a wave takes together ([`Structured::wide`]) taken by the whole
+/// thread group instead: for a group of several console waves, whose barriers (the halves'
+/// exchanges, LDS order) every thread of the group must reach. A branch is entered when some
+/// lane of the group enters it, and left out only when every lane does; a console wave that
+/// would have stayed out runs it with its own lanes masked off.
+pub(super) fn with_group_wide<R>(f: impl FnOnce() -> R) -> R {
+    let was = GROUP_WIDE.replace(true);
+    let r = f();
+    GROUP_WIDE.set(was);
+    r
+}
+
 pub(super) fn with_local_waves<R>(f: impl FnOnce() -> R) -> R {
     let was = LOCAL_WAVES.replace(true);
     let r = f();
@@ -3703,6 +3720,42 @@ impl<'a> Lower<'a> {
         (lo, hi)
     }
 
+    /// The OR of `mine` (the same in every lane of a host wave) over the two host waves of
+    /// this thread's console wave; with [`with_group_wide`], over every host wave of the group:
+    /// each half writes its dword of its console wave's pair, then every thread reads all the
+    /// pairs.
+    fn halves_or(&mut self, at: usize, mine: V) -> V {
+        let group = self.s.threads.map_or(64, |t| t.iter().product::<u32>());
+        let wide = GROUP_WIDE.with(|g| g.get()) && group > 64 && !self.local;
+        let Some(slot) = self.exchange.as_ref().filter(|e| wide && !e.1).map(|e| e.0) else {
+            let (lo, hi) = self.exchange_halves(at, mine);
+            let c = self.cur;
+            return self.s.m.bin(c, Bin::Or, lo, hi);
+        };
+        let pair = self.exchange_pair(slot);
+        let cl = self.console_lane();
+        let five = self.s.m.i32(5);
+        let half = self.s.m.bin(at, Bin::LShr, cl, five);
+        let index = self.s.m.bin(at, Bin::Add, pair, half);
+        let lds = self.s.lds();
+        let ptr = self.s.m.element(at, lds, index);
+        self.s.m.store(at, ptr, mine);
+        self.group_sync(at);
+        let mut all = None;
+        for k in 0..2 * group.div_ceil(64) {
+            let i = self.s.m.i32(slot + k);
+            let p = self.s.m.element(at, lds, i);
+            let v = self.s.m.load(at, p);
+            all = Some(match all {
+                None => v,
+                Some(a) => self.s.m.bin(at, Bin::Or, a, v),
+            });
+        }
+        // the slots are written again only after every thread read them
+        self.group_sync(at);
+        all.unwrap_or(mine)
+    }
+
     /// The first of the two exchange dwords of this thread's console wave (made in the entry
     /// block): a group of several console waves has a pair for each.
     fn exchange_pair(&mut self, slot: u32) -> V {
@@ -3756,8 +3809,7 @@ impl<'a> Lower<'a> {
             return Err("a lane mask exchanged where not every lane runs");
         }
         let some = self.s.m.cast(at, Cast::ZExt, some, i32t);
-        let (lo, hi) = self.exchange_halves(at, some);
-        let both = self.s.m.bin(at, Bin::Or, lo, hi);
+        let both = self.halves_or(at, some);
         let z = self.s.m.i32(0);
         Ok(self.s.m.cmp(at, pred::NE, both, z))
     }
@@ -3798,9 +3850,8 @@ impl<'a> Lower<'a> {
         let some = self.s.op(c, "waveAnyTrue", Attr::NoUnwind, i1t, 113, &[set]);
         self.s.flags |= flags::WAVE_OPS;
         let some = self.s.m.cast(c, Cast::ZExt, some, i32t);
-        let (lo, hi) = self.exchange_halves(c, some);
+        let both = self.halves_or(c, some);
         let c = self.cur;
-        let both = self.s.m.bin(c, Bin::Or, lo, hi);
         let z = self.s.m.i32(0);
         Ok(self.s.m.cmp(c, if any { pred::NE } else { pred::EQ }, both, z))
     }

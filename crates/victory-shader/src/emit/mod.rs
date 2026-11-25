@@ -519,10 +519,18 @@ fn widen(
         offset: 0,
         what: "wave-wide branches in a thread group of several console waves",
     };
+    let mut group = false;
     match native.io {
         // (a program whose waves are the host's meets no one: no barrier, any group)
         crate::native::StageIo::Cs(_) if !(native.wave64 && lower::host_max_wave() == 32) => {}
         crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64 => {}
+        // Several console waves in a group: the branches are taken group-wide instead
+        // ([`lower::with_group_wide`]), for a program listed in `VICTORY_WAVE_WIDE_ONLY` only:
+        // that is right only where the program's scalar branches go the same way in every
+        // console wave of the group (conditions from constants, not from lane reads).
+        crate::native::StageIo::Cs(_) if WAVE_WIDE_HERE.with(|w| w.get()) => {
+            group = true;
+        }
         crate::native::StageIo::Cs(cs) => {
             if why {
                 eprintln!("WAVE64-WIDE not tried: thread groups of {:?}", cs.threads);
@@ -537,7 +545,11 @@ fn widen(
         let io = io::raise(p, native)?;
         let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
         lower::take_needs();
-        let r = emit_program(c, native, p, &st, &io, &res);
+        let r = if group {
+            lower::with_group_wide(|| emit_program(c, native, p, &st, &io, &res))
+        } else {
+            emit_program(c, native, p, &st, &io, &res)
+        };
         let needs = lower::take_needs();
         // (or translated for 64-lane waves still: shared memory read and written where not
         // every lane runs, whose blocks the lowering names too)
