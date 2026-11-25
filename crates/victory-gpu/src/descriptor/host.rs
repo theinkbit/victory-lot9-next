@@ -99,6 +99,8 @@ pub(crate) struct HostHeap {
 /// No host heap is needed, so it is tested without one.
 #[derive(Default)]
 pub(crate) struct Spans {
+    /// When a newer view makes an older one stale.
+    rule: Rule,
     by_start: std::collections::BTreeMap<u64, (u64, std::collections::BTreeSet<u32>)>,
     by_slot: std::collections::HashMap<u32, u64>,
     /// The bytes a placed texture takes, by resource description: worked
@@ -106,6 +108,28 @@ pub(crate) struct Spans {
     /// descriptions, thousands of times a frame).
     sizes: std::collections::HashMap<[u32; 14], Option<u64>>,
 }
+
+/// When a view the title writes makes an older view of other memory stale
+/// (ZSlayerHQ/victory-world-runtime 310c6eb).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Rule {
+    /// When it starts where the older one starts: at the same address with
+    /// another length, or within the older one's first [`HEAD`] bytes (or
+    /// the older within its own). A title that holds only a texture's
+    /// smallest levels puts the next texture where the larger ones would
+    /// be, so a view that only reaches into that range says nothing.
+    #[default]
+    Start,
+    /// Whenever their spans at full size overlap (the old rule: it took
+    /// packed neighbours out of the queue). `VICTORY_STALE_TEXTURES=overlap`.
+    Overlap,
+    /// Never; a clashing view is left out instead. `VICTORY_STALE_TEXTURES=0`.
+    Never,
+}
+
+/// The first bytes of a placed texture that are its own under
+/// [`Rule::Start`]: the block its smallest levels share.
+const HEAD: u64 = 4096;
 
 impl Spans {
     /// The bytes of title memory a placed texture with the resource
@@ -144,12 +168,22 @@ impl Spans {
         if end <= start {
             return Vec::new();
         }
+        let rule = self.rule;
+        // The spans the view cannot be there with.
+        let clashing: Vec<u64> = match rule {
+            Rule::Start => self
+                .by_start
+                .range(start.saturating_sub(HEAD - 1)..start.saturating_add(HEAD))
+                .map(|(at, _)| *at)
+                .collect(),
+            Rule::Overlap | Rule::Never => self.overlapping(start, end),
+        };
         let mut stale = Vec::new();
-        for at in self.overlapping(start, end) {
+        for at in clashing {
             if at == start && same(self.by_start.get(&at)) {
                 continue;
             }
-            if !newer {
+            if !newer || rule == Rule::Never {
                 return stale;
             }
             if let Some((_, slots)) = self.by_start.remove(&at) {
@@ -206,11 +240,17 @@ static SPANNED: [std::sync::atomic::AtomicU64; 2] = [
 pub(crate) static STALE: [std::sync::atomic::AtomicU64; 5] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
-/// Whether a view written over memory that older views describe otherwise
-/// makes those stale; `VICTORY_STALE_TEXTURES=0` leaves them as they are.
-fn stale_out() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_STALE_TEXTURES").is_none_or(|v| v != "0"))
+/// When a view the title writes makes older views of other memory stale
+/// ([`Rule`]): where it starts in the block of their smallest levels, by
+/// default; `VICTORY_STALE_TEXTURES=0`: never; `=overlap`: wherever their
+/// spans overlap (the old rule).
+fn stale_rule() -> Rule {
+    static RULE: std::sync::OnceLock<Rule> = std::sync::OnceLock::new();
+    *RULE.get_or_init(|| match std::env::var("VICTORY_STALE_TEXTURES").as_deref() {
+        Ok("0") => Rule::Never,
+        Ok("overlap") => Rule::Overlap,
+        _ => Rule::Start,
+    })
 }
 
 /// The runtime mapped or unmapped title memory `[at, at + len)`, or is
@@ -1064,7 +1104,10 @@ impl HostHeap {
                 Some((start, end)) => {
                     SPANNED[0].fetch_min(start, Relaxed);
                     SPANNED[1].fetch_max(end, Relaxed);
-                    placed.note(index, start, end, !seen && stale_out())
+                    {
+                        placed.rule = stale_rule();
+                        placed.note(index, start, end, !seen)
+                    }
                 }
                 None => {
                     placed.forget(index);
@@ -2396,9 +2439,24 @@ mod tests {
 
     /// A view written over memory that older views describe otherwise
     /// makes those stale; views of the same span are one texture's.
+    /// Textures of which only the smallest levels are held, packed into one
+    /// another's address range: writing any of them leaves the others; one
+    /// written inside another's first 4 KiB replaces it.
+    #[test]
+    fn packed_neighbours_stay() {
+        let mut spans = Spans::default();
+        let at = 0xb_86bf_8000u64;
+        let (a, b, c) = (at, at + 0x2000, at + 0x6000);
+        assert!(spans.note(1, a, a + 0x2c000, true).is_empty());
+        assert!(spans.note(2, b, b + 0x2c000, true).is_empty());
+        assert!(spans.note(3, c, c + 0x2c000, true).is_empty());
+        assert!(spans.note(4, a, a + 0x2c000, true).is_empty());
+        assert_eq!(spans.note(5, b + 0x800, b + 0x1800, true), [2]);
+    }
+
     #[test]
     fn a_newer_view_of_other_memory_makes_the_older_stale() {
-        let mut spans = Spans::default();
+        let mut spans = Spans { rule: Rule::Overlap, ..Spans::default() };
         // Three textures side by side, the first in two slots.
         assert!(spans.note(1, 0x1000, 0x3000, true).is_empty());
         assert!(spans.note(2, 0x1000, 0x3000, true).is_empty());
