@@ -195,6 +195,20 @@ pub struct Io {
 /// Raises the I/O of `p`, built from `native`'s patched code. Fails for
 /// stages whose stage data is not read and on constructs not covered yet.
 pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
+    raise_with(p, native, false)
+}
+
+/// [`raise`], and with `lone_firsts` also a first half of an interpolation
+/// that evaluates on its own ([`Interp::Weighted`]) where something other
+/// than a second half reads its result. Only for a program whose lowering
+/// failed without it (`emit::translate`): the attribute row becomes one
+/// read per vertex, which a row packed with interpolated elements of
+/// another mode may not be.
+pub fn raise_with(
+    p: &Program,
+    native: &NativeProgram,
+    lone_firsts: bool,
+) -> Result<Io, ShaderError> {
     let unsupported = |offset, what| ShaderError::Unsupported { offset, what };
     let (loaded, ps_inputs, params) = match (&native.io, native.stage) {
         (
@@ -369,6 +383,8 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
         defs: &defs,
         phis: &phis,
     };
+    // Every first half (`v_interp_p1*`) seen, with its attribute.
+    let mut firsts: Vec<(Site, Attribute)> = Vec::new();
     for (b, block) in p.blocks.iter().enumerate() {
         for (i, inst) in block.insts.iter().enumerate() {
             let site = (b, i);
@@ -382,7 +398,7 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                             io.interps
                                 .push((site, Interp::Vertex { attribute, vertex }));
                         }
-                        ("v_interp_p1_f32", _) => {}
+                        ("v_interp_p1_f32", _) => firsts.push((site, attribute)),
                         ("v_interp_p2_f32", Operand::Vector { reg, .. }) => {
                             let Operand::Vector { reg: d, .. } = *dst else {
                                 return Err(unsupported(at, "an interpolation operand"));
@@ -402,7 +418,7 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                     }
                 }
                 Fields::Valu(v) if name.starts_with("v_interp_") => match name {
-                    "v_interp_p1ll_f16" => {}
+                    "v_interp_p1ll_f16" => firsts.push((site, attribute(inst, &v.src[0])?)),
                     "v_interp_p2_f16" => {
                         let attribute = attribute(inst, &v.src[0])?;
                         let read = |k: usize| match v.src.get(k) {
@@ -460,7 +476,55 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
             }
         }
     }
+    // A first half whose result something other than a second half reads
+    // (directly or through phis: an export on a path that skips the second
+    // half), or that no second half pairs: it evaluates on its own, P0 + i
+    // P10, from the attribute's vertex values, as the hardware computes it.
+    // Without this such pixel programs did not translate (the deferred
+    // material programs among them).
+    for (site, attribute) in firsts.into_iter().filter(|_| lone_firsts) {
+        if io.interps.iter().any(|(s, _)| *s == site) {
+            continue;
+        }
+        let paired = io
+            .interps
+            .iter()
+            .any(|(_, i)| matches!(i, Interp::Interpolated { first, .. } if first.contains(&site)));
+        let (b, i) = site;
+        let result = p.blocks[b].insts[i]
+            .writes
+            .iter()
+            .find_map(|&(r, v)| matches!(r, Reg::V(_)).then_some(v));
+        if !paired || result.is_some_and(|v| read_beyond_second_halves(p, v)) {
+            io.interps.push((site, Interp::Weighted { attribute }));
+        }
+    }
     Ok(io)
+}
+
+/// Whether value `v` (a first half's result) is read by anything but a
+/// second half (`v_interp_p2*`), following it through the phis it feeds.
+fn read_beyond_second_halves(p: &Program, v: Value) -> bool {
+    let mut todo = vec![v];
+    let mut seen = vec![v];
+    while let Some(v) = todo.pop() {
+        for block in &p.blocks {
+            for inst in &block.insts {
+                if inst.reads.iter().any(|&(_, r)| r == v)
+                    && !inst.name().starts_with("v_interp_p2")
+                {
+                    return true;
+                }
+            }
+            for phi in &block.phis {
+                if phi.args.contains(&v) && !seen.contains(&phi.value) {
+                    seen.push(phi.value);
+                    todo.push(phi.value);
+                }
+            }
+        }
+    }
+    false
 }
 
 /// The pixel input VGPRs that `addr` enables, with their meaning.
@@ -696,6 +760,29 @@ mod tests {
         // attr1 is not in the stage data.
         let other = program(&[0xC808_0400, S_ENDPGM]); // v_interp_p1_f32 v2, v0, attr1.x
         assert!(raise(&other, &pixel(vec![TEXCOORD], 2)).is_err());
+    }
+
+    #[test]
+    fn a_first_half_no_second_half_reads_evaluates_on_its_own() {
+        // p1's result exported as it is: P0 + i P10.
+        let p = program(&[
+            0xC808_0000, // v_interp_p1_f32 v2, v0, attr0.x
+            0xF800_180F,
+            0x0302_0102, // exp mrt0, v2, v1, v2, v3 done vm
+            S_ENDPGM,
+        ]);
+        let io = raise_with(&p, &pixel(vec![TEXCOORD], 2), true).unwrap();
+        let attribute = Attribute {
+            usage: Usage::Generic,
+            row: 1,
+            channel: 0,
+            high: false,
+        };
+        assert_eq!(io.interps, [((0, 0), Interp::Weighted { attribute })]);
+        // Without the fallback nothing covers it (the lowering fails and
+        // `emit::translate` asks again).
+        let plain = raise(&p, &pixel(vec![TEXCOORD], 2)).unwrap();
+        assert!(plain.interps.is_empty());
     }
 
     #[test]

@@ -450,3 +450,125 @@ fn scc_of_a_mask_operation_joined_with_a_scalar_test_needs_the_skip_wave_wide() 
     }
     eprintln!("ran on the hardware device: the inner test's SCC for every lane once some lane is inside");
 }
+
+/// A block-wide scan over the console waves of a 512-thread group, the shape of the
+/// ray-tracing structure builder's scans: lane 63 of each console wave stores the wave's
+/// total (64) to shared memory, the group meets at `s_barrier`, and each lane then sums the
+/// totals of the waves below its own in a loop that its whole console wave leaves together
+/// (its exit compares the wave's number), carrying the sum in a scalar through
+/// `v_readfirstlane` inside the loop, where only some lanes of the group run. On a host of
+/// 32-lane waves that first-lane read needs no exchange: the value is a scalar plus a
+/// shared-memory read at a scalar address whose memory has settled, the same in both halves
+/// of a console wave (`lane_uniform`, `lds_settled`). Every thread stores the sum,
+/// 64 x its wave's number.
+#[test]
+fn a_scan_over_console_waves_sums_each_waves_predecessors() {
+    const fn ds(op: u32, vdst: u32, addr: u32, data0: u32) -> [u32; 2] {
+        [0x36 << 26 | op << 18, vdst << 24 | data0 << 8 | addr]
+    }
+    let mut words = vec![
+        0x2C0E_0086, // v_lshrrev_b32 v7, 6, v0: the console wave's number
+        0x3410_0E82, // v_lshlrev_b32 v8, 2, v7: its total's address
+        0x7E0C_02C0, // v_mov_b32 v6, 64: the total
+        0xD765_000F,
+        0x0001_00C1, // v_mbcnt_lo_u32_b32 v15, -1, 0
+        0xD766_000F,
+        0x0002_1EC1, // v_mbcnt_hi_u32_b32 v15, -1, v15: the lane in the console wave
+        0xBE96_047E, // s_mov_b64 s[22:23], exec
+        0x7DA4_1EBF, // v_cmpx_eq_u32 exec, 63, v15
+    ];
+    words.extend(ds(0x0D, 0, 8, 6)); // ds_write_b32 v8, v6
+    words.extend_from_slice(&[
+        0xBEFE_0416, // s_mov_b64 exec, s[22:23]
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xBF8A_0000, // s_barrier
+        0xBE94_047E, // s_mov_b64 s[20:21], exec
+        0x7E18_0280, // v_mov_b32 v12, 0: the sum (wave 0 adds nothing)
+        0x7DAA_0E80, // v_cmpx_ne_u32 exec, 0, v7: the waves above the first
+        0xBF88_0000, // s_cbranch_execz (the end, patched below)
+        0xBE98_047E, // s_mov_b64 s[24:25], exec: the lanes still looping
+        0xBE90_0380, // s_mov_b32 s16, 0: the waves added
+        0xBE92_0380, // s_mov_b32 s18, 0: the sum so far
+        0xBF82_0000, // s_branch (the body, patched below)
+    ]);
+    let skip = words.len() - 5;
+    let enter = words.len() - 1;
+    let latch = words.len();
+    words.extend_from_slice(&[
+        0x87FE_181A, // s_and_b64 exec, s[26:27], s[24:25]: the lanes still looping
+        0x7E24_050C, // v_readfirstlane_b32 s18, v12: the sum so far
+    ]);
+    let body = words.len();
+    words.extend_from_slice(&[
+        0x8F11_8210, // s_lshl_b32 s17, s16, 2
+        0x8110_8110, // s_add_i32 s16, s16, 1
+        0x7E14_0211, // v_mov_b32 v10, s17
+    ]);
+    words.extend(ds(0x36, 11, 10, 0)); // ds_read_b32 v11, v10
+    words.extend_from_slice(&[
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x4A18_1612, // v_add_nc_u32 v12, s18, v11
+        0xBE9A_047E, // s_mov_b64 s[26:27], exec
+        0x7DA4_0E10, // v_cmpx_eq_u32 exec, s16, v7: the lanes whose wave's count is reached
+        0x8A98_7E18, // s_andn2_b64 s[24:25], s[24:25], exec: leave
+        0xBF85_0000, // s_cbranch_scc1 (the latch, patched below)
+    ]);
+    let again = words.len() - 1;
+    let end = words.len();
+    words.extend_from_slice(&[
+        0xBEFE_0414, // s_mov_b64 exec, s[20:21]
+        0x341C_0082, // v_lshlrev_b32 v14, 2, v0
+        0xE070_1000,
+        0x8002_0C0E, // buffer_store_dword v12, v14, s[8:11], 0 offen
+    ]);
+    // branch offsets in dwords from the instruction after the branch
+    let rel = |from: usize, to: usize| (to as i32 - (from as i32 + 1)) as u16 as u32;
+    words[skip] |= rel(skip, end);
+    words[enter] |= rel(enter, body);
+    words[again] |= rel(again, latch);
+    let mut native = native_of(&words, true, 512);
+    if let StageIo::Cs(cs) = &mut native.io {
+        cs.rsrc2 |= 1 << 15; // 512 bytes of shared memory
+    }
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let shader = lowered(&native, &p, &HashSet::new()).expect("lower");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return;
+    };
+    let (root, pso) = match host.compute_pipeline(&shader) {
+        Ok(x) => x,
+        Err(e) => panic!("the hardware device refuses the scan: {e}"),
+    };
+    let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+    let out = host
+        .dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(ud))],
+                views: &[View::RawUav(512)],
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        )
+        .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+    let want: Vec<u32> = (0..512u32).map(|t| 64 * (t >> 6)).collect();
+    let wrong: Vec<(usize, u32, u32)> = out[0]
+        .iter()
+        .zip(&want)
+        .enumerate()
+        .filter(|(_, (got, want))| got != want)
+        .map(|(t, (&got, &want))| (t, got, want))
+        .take(8)
+        .collect();
+    assert!(wrong.is_empty(), "threads (index, got, want): {wrong:?}");
+    eprintln!("ran on the hardware device: every thread has its waves' predecessors' sum");
+}

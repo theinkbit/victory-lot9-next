@@ -273,6 +273,29 @@ pub fn emit(
     io: &io::Io,
     res: &resource::Resources,
 ) -> Result<HostShader, ShaderError> {
+    let first = emit_once(c, native, p, st, io, res);
+    // A first half of an interpolation read where no second half is (the
+    // deferred material programs export one on a path that skips it): once
+    // more, those halves evaluating on their own. Only then, so a program
+    // that translated keeps its translation (the fallback makes the
+    // attribute's row a per-vertex one).
+    match first {
+        Err(ShaderError::Unsupported { what, .. }) if what == lower::FIRST_HALF => {
+            let io = io::raise_with(p, native, true)?;
+            emit_once(c, native, p, st, &io, res).or(first)
+        }
+        other => other,
+    }
+}
+
+fn emit_once(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+) -> Result<HostShader, ShaderError> {
     // (what an earlier program's lowering on this thread left behind)
     lower::take_needs();
     let original = emit_program(c, native, p, st, io, res);
