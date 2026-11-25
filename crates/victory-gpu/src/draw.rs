@@ -429,6 +429,13 @@ pub(crate) fn dispatched() -> u64 {
 /// streams of a cutscene frame reach further, and what lay past the first
 /// megabyte was never brought up to date - meshes without bodies, exploded
 /// triangles. `VICTORY_ROOT_VIEW_MB` sets a limit again.)
+/// Whether table constant buffers in copies in the card's memory are read there
+/// (`VICTORY_CARD_CONSTANTS=0`: filled into upload memory, as before).
+fn card_constants() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_CONSTANTS").is_none_or(|v| v != "0"))
+}
+
 fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
     static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let limit = *LIMIT.get_or_init(|| {
@@ -2232,6 +2239,23 @@ impl State {
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
+                        // In a copy in the card's memory at a 256-byte aligned place: read
+                        // there, as an aligned root constant buffer is (`root_view`). That
+                        // copy takes the title's writes by copies queued before the draw, so
+                        // the draw sees earlier flights' writes and later rewrites come after
+                        // it; a fill of upload memory would read title memory on the CPU,
+                        // which waits for every flight that may write it.
+                        // `VICTORY_CARD_CONSTANTS=0`: always a fill, as before.
+                        if card_constants()
+                            && let Some(shadow) = crate::shadow::find(address, 1)
+                            && shadow.carded()
+                            && shadow.gpu(address) % 256 == 0
+                            && shadow.left(address) >= u64::from(size).next_multiple_of(256)
+                        {
+                            shadow.refresh(list, address, u64::from(size));
+                            host.constant_at(index, shadow.gpu(address), size);
+                            continue;
+                        }
                         let Some((gpu, to)) = list.scratch(u64::from(size)) else {
                             host.make_null(index);
                             continue;
