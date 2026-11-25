@@ -67,7 +67,11 @@ pub(crate) struct Shader {
 
 impl std::fmt::Debug for Shader {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} {}", self.stage, self.hash)
+        write!(f, "{} {}", self.stage, self.hash)?;
+        match library::shader_name(&self.hash) {
+            Some(name) => write!(f, " ({name})"),
+            None => Ok(()),
+        }
     }
 }
 

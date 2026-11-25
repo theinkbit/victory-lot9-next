@@ -338,6 +338,10 @@ pub fn warm(
     }
     let started = std::time::Instant::now();
     let seen = Mutex::new(HashSet::new());
+    // The name each container has in its archive, by the hash a run's log
+    // names it by: written next to the cache (`shader-names.txt`) so a run
+    // names the shaders it refuses or drops draws of.
+    let names: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
     let cache_error = OnceLock::new();
     // Cached translations, new translations, cached refusals, new refusals.
     let counts = [const { AtomicUsize::new(0) }; 4];
@@ -374,6 +378,10 @@ pub fn warm(
                                 let hash = blake3::hash(container);
                                 if !lock(&seen).insert(hash) {
                                     continue;
+                                }
+                                let label = job.label();
+                                if let Some((_, name)) = label.split_once(' ') {
+                                    lock(&names).push((hash.to_hex()[..16].to_owned(), name.to_owned()));
                                 }
                                 let k = match victory_gpu::shader_cache::precompile_shader(container) {
                                     Ok(PrecompileOutcome::Cached) => 0,
@@ -416,6 +424,13 @@ pub fn warm(
         }
     }
     let [cached, translated, cached_refusals, refused] = counts.map(AtomicUsize::into_inner);
+    {
+        let mut names = names.into_inner().unwrap_or_else(|e| e.into_inner());
+        names.sort();
+        let text: String = names.iter().map(|(h, n)| format!("{h} {n}
+")).collect();
+        let _ = std::fs::write(dir.join("shader-names.txt"), text);
+    }
     let bytes: u64 = walkdir::WalkDir::new(&dir)
         .into_iter()
         .filter_map(Result::ok)

@@ -62,6 +62,27 @@ pub fn use_pipeline_cache(dir: PathBuf) {
     let _ = DIR.set(dir);
 }
 
+/// The name a shader has in its archive, by the 16 hex digits a run's log
+/// names it by: from `shader-names.txt` in the shader cache next to this
+/// one, which the precompile (`victory translate --cache`) writes.
+pub(crate) fn shader_name(hash: &str) -> Option<&'static str> {
+    static NAMES: std::sync::OnceLock<std::collections::HashMap<String, String>> = std::sync::OnceLock::new();
+    let names = NAMES.get_or_init(|| {
+        let Some(file) = DIR.get().and_then(|d| d.parent()).map(|d| d.join("shaders").join("shader-names.txt")) else {
+            return Default::default();
+        };
+        std::fs::read_to_string(file)
+            .map(|text| {
+                text.lines()
+                    .filter_map(|l| l.split_once(' '))
+                    .map(|(h, n)| (h.to_owned(), n.to_owned()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    });
+    names.get(hash).map(String::as_str)
+}
+
 /// Host pipelines created, loaded from the library, and title pipelines
 /// started at creation, since the start.
 pub(crate) static MADE: AtomicU64 = AtomicU64::new(0);
