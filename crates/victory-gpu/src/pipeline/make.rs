@@ -167,6 +167,10 @@ fn shared_budget() -> bool {
 
 /// Waits for `p` while frame `frame` has budget left.
 fn wait(p: &Pending, frame: u64) {
+    // Catch-up (P, `crate::debugui`): a frame waits for every pipeline it draws with.
+    #[cfg(windows)]
+    let budget = if crate::debugui::catch_up() { Duration::from_secs(60) } else { wait_budget() };
+    #[cfg(not(windows))]
     let budget = wait_budget();
     if budget.is_zero() {
         return;

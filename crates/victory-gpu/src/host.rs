@@ -6016,6 +6016,24 @@ impl Meter {
                 placed = crate::descriptor::host::PLACED_TEXTURE_SLOTS.load(Ordering::Relaxed),
                 objects = crate::descriptor::host::OBJECT_TEXTURE_SLOTS.load(Ordering::Relaxed)
             );
+            crate::debugui::frame(crate::debugui::Frame {
+                fps: fps as f64,
+                ms: ms as f64,
+                preparing: cpu as f64,
+                copies: copy_ms as f64,
+                textures: texture_ms as f64,
+                gpu: gpu as f64,
+                back: back_ms as f64,
+                heap_passes: picked_ms as f64,
+                draws: draws as f64,
+                dropped: dropped as f64,
+                indirect: indirect as f64,
+                making: crate::pipeline::making(),
+                textures_waiting: crate::draw::HEAP_TEXTURES_WAITING.load(Ordering::Relaxed),
+            });
+            crate::debugui::drops(
+                drops.iter().take(8).map(|(why, n)| (why.to_string(), *n as f64 / frames)).collect(),
+            );
             #[cfg(feature = "diagnostics")]
             {
                 crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);
@@ -6035,6 +6053,7 @@ impl Meter {
             buffer.truncate(n.max(0) as usize);
             self.caption = Some(buffer);
         }
+        crate::debugui::attach(hwnd.0 as usize);
         let Some(caption) = &self.caption else { return };
         let text = format!(" | VIctory {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame");
         let mut text: Vec<u16> = caption.iter().copied().chain(text.encode_utf16()).collect();

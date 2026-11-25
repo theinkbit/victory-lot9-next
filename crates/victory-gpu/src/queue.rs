@@ -760,6 +760,9 @@ extern "system" fn present(
     plane_parameters: *const Plane,
     _parameters: *const u8,
 ) -> HRESULT {
+    // Catch-up (P): the title waits here until no pipeline is being made.
+    #[cfg(windows)]
+    crate::debugui::hold_for_catch_up();
     #[cfg(all(windows, feature = "diagnostics"))]
     crate::copystat::present_begins();
     // Submissions sent to the card and not waited for are settled first,
