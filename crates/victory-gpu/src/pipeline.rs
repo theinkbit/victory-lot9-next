@@ -696,6 +696,8 @@ fn read_stream(
         };
         at += size;
     }
+    #[cfg(windows)]
+    graphics.integer_targets_unblended();
     (shaders, graphics)
 }
 
