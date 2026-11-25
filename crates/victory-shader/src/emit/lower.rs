@@ -5836,7 +5836,10 @@ impl<'a> Lower<'a> {
             // address (from the host) plus the load's offset.
             // The same for one loaded from the resource heap (bindless), at
             // the heap's title address.
-            if let Some(a) = self.scalar.get(&site).copied()
+            // (Not eight dwords: an image measured for its size takes the
+            // host view's size below, the heap's bytes may not be the title's.)
+            if count != 8
+                && let Some(a) = self.scalar.get(&site).copied()
                 && let Some(rp) = self.x.native.layout.get(a.param).copied()
                 && let Some((word, slot)) = match rp.root {
                     RootType::Table => Some((super::shader::USER_TABLE_ADDRESS, rp.slot)),
