@@ -10,6 +10,28 @@ correctly and playably on one particular PC.
 copy of the game. It is not affiliated with or endorsed by Rockstar Games or
 Take-Two Interactive.
 
+## This branch (play-next)
+
+A personal test branch, not an original project. It is AnyXboxX's `lot9` line
+([LooperSalty/victory](https://github.com/LooperSalty/victory), branch
+`anyxboxx/fork-7b0-lot9-murs` at 80d58f8) with these on top, each commit naming
+where it comes from:
+
+- From [fxceless/victory-fork](https://github.com/fxceless/victory-fork): the
+  watchdog hooks (upstream #454 via #364), integer render targets without
+  blending (#501), the ray-tracing builder's 32-lane scans (#601), and commits
+  a803c87, c96b4f2, c6dc4d8 and 10ea38e.
+- From [Trexies/victory-fork](https://github.com/Trexies/victory-fork) (branch
+  `VIwork`): `VICTORY_COPY_COMPARE` (4d08198) and card batching (31d6ae2).
+- From [ZSlayerHQ/victory-world-runtime](https://github.com/ZSlayerHQ/victory-world-runtime):
+  the stale-texture start rule (310c6eb).
+- Local: a debug overlay (F10; P waits for pipelines to catch up), shader names
+  in logs, `VICTORY_HEAP_TEXTURE_MB`, a shadow descriptor and `ds_bpermute` fix,
+  and `VICTORY_WAVE_WIDE_ONLY`, which turns the wide wave64 form on for listed
+  programs only (group-wide branches for groups of several console waves).
+
+Tested on one PC only: Windows 11, NVIDIA RTX 4000 SFF Ada. Expect 3 to 7 fps.
+
 ## Credits
 
 - **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its
